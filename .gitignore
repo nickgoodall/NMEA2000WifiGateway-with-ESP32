@@ -1,0 +1,17 @@
+# Internal — never publish to public repos
+CLAUDE.md
+docs/
+logs/
+
+# PlatformIO
+.pio/
+.pioenvs/
+.piolibdeps/
+
+# IDE
+.vscode/
+*.code-workspace
+
+# OS
+.DS_Store
+Thumbs.db
