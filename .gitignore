@@ -1,17 +1,16 @@
-# Internal — never publish to public repos
+# ── Internal — never publish to public repos ─────────────────────────────────
 CLAUDE.md
-docs/
-logs/
+private/
 
-# PlatformIO
+# ── PlatformIO build artifacts ────────────────────────────────────────────────
 .pio/
 .pioenvs/
 .piolibdeps/
 
-# IDE
+# ── IDE ───────────────────────────────────────────────────────────────────────
 .vscode/
 *.code-workspace
 
-# OS
+# ── OS ────────────────────────────────────────────────────────────────────────
 .DS_Store
 Thumbs.db
