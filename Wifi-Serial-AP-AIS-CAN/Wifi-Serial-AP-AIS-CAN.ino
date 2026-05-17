@@ -17,6 +17,9 @@
 #define ESP32_CAN_TX_PIN GPIO_NUM_5  // Set CAN TX port to 5 (Caution!!! Pin 2 before)
 #define ESP32_CAN_RX_PIN GPIO_NUM_4  // Set CAN RX port to 4
 
+#define INTERNAL_LED 2
+
+#include "esp_mac.h"
 #include <Arduino.h>
 #include <NMEA2000_CAN.h>  // This will automatically choose right CAN library and create suitable NMEA2000 object
 #include <Seasmart.h>
@@ -28,44 +31,64 @@
 #include <DallasTemperature.h>
 #include <Preferences.h>
 #include <ArduinoJson.h>
+#include <ESPmDNS.h>
+#include <WiFiClientSecure.h>
+#include <PubSubClient.h>
 
 #include "N2kDataToNMEA0183.h"
 #include "List.h"
 #include "index_html.h"
+#include "sw_js.h"
+#include "leaflet_js.h"
+#include "settings_html.h"
 #include "BoatData.h"
+#include "LocalSensors.h"
+#include "RuuviScanner.h"
+
+// ── Simulation mode ──────────────────────────────────────────────────────────
+// Comment out the next line when connected to real NMEA2000 / AIS hardware.
+// With mock disabled and no live data the dashboard shows a clear NO DATA
+// indicator for every instrument group that has not been updated by hardware.
+#define USE_MOCK_DATA
+#include "MockData.h"
 
 
-#define ENABLE_DEBUG_LOG 0 // Debug log, set to 1 to enable AIS forward on USB-Serial / 2 for ADC voltage to support calibration
-#define UDP_Forwarding 0   // Set to 1 for forwarding AIS from serial2 to UDP brodcast
+#define ENABLE_DEBUG_LOG 1 // Debug log, set to 1 to enable AIS forward on USB-Serial / 2 for ADC voltage to support calibration
+#define UDP_Forwarding 1   // Set to 1 for forwarding AIS from serial2 to UDP brodcast
 #define HighTempAlarm 12   // Alarm level for fridge temperature (higher)
 #define LowVoltageAlarm 11 // Alarm level for battery voltage (lower)
 
 #define ADC_Calibration_Value 34.3 // The real value depends on the true resistor values for the ADC input (100K / 27 K)
 
-#define WLAN_CLIENT 0  // Set to 1 to enable client network. 0 to act as AP only
+// WiFi config — loaded from NVS ("wifi_cfg") at boot, editable via /settings
+static uint8_t wifiMode    = 0;            // 0=AP only  1=STA only  2=AP+STA
+static char    apSsid[33]  = "NMEA2000-GW";
+static char    apPass[65]  = "nmea2000";
+static char    staSsid[33] = "";
+static char    staPass[65] = "";
+static bool    staConnected = false;
 
-// Wifi cofiguration Client and Access Point
-const char *AP_ssid = "MyESP32";  // ESP32 as AP
-const char *CL_ssid = "MyWLAN";   // ESP32 as client in network
+// MQTT config — loaded from NVS ("mqtt_cfg") at boot, editable via /settings
+static bool mqttEnabled      = false;
+static char mqttHost[129]    = "";
+static uint16_t mqttPort     = 8883;
+static char mqttUser[65]     = "";
+static char mqttPass[129]    = "";
+static char mqttTopic[65]    = "boat/myyacht";
+static bool mqttConnected    = false;
 
-const char *AP_password = "appassword";   // AP password. Must be longer than 7 characters
-const char *CL_password = "clientpassword";  // Client password
+static WiFiClientSecure* mqttTlsClient = nullptr;
+static PubSubClient*     mqttClient    = nullptr;
 
-// Put IP address details here
-IPAddress AP_local_ip(192, 168, 15, 1);  // Static address for AP
+// AP always uses a fixed subnet so the dashboard IP is predictable
+IPAddress AP_local_ip(192, 168, 15, 1);
 IPAddress AP_gateway(192, 168, 15, 1);
 IPAddress AP_subnet(255, 255, 255, 0);
-
-IPAddress CL_local_ip(192, 168, 1, 10);  // Static address for Client Network. Please adjust to your AP IP and DHCP range!
-IPAddress CL_gateway(192, 168, 1, 1);
-IPAddress CL_subnet(255, 255, 255, 0);
-
-int wifiType = 0; // 0= Client 1= AP
 
 const uint16_t ServerPort = 2222; // Define the port, where server sends data. Use this e.g. on OpenCPN. Use 39150 for Navionis AIS
 
 // UPD broadcast for Navionics, OpenCPN, etc.
-const char * udpAddress = "192.168.15.255"; // UDP broadcast address. Should be the network of the ESP32 AP (please check!)
+char udpAddress[16] = "192.168.15.255"; // AP subnet broadcast; updated to 255.255.255.255 in STA/Both modes
 const int udpPort = 2000; // port 2000 lets think Navionics it is an DY WLN10 device
 
 // Create UDP instance
@@ -99,6 +122,9 @@ tN2kDataToNMEA0183 tN2kDataToNMEA0183(&NMEA2000, 0);
 
 // Set the information for other bus devices, which messages we support
 const unsigned long TransmitMessages[] PROGMEM = {127489L, // Engine dynamic
+                                                  130312L, // Temperature (Ruuvi)
+                                                  130313L, // Humidity    (Ruuvi)
+                                                  130314L, // Pressure    (Ruuvi)
                                                   0
                                                  };
 const unsigned long ReceiveMessages[] PROGMEM = {/*126992L,*/ // System time
@@ -118,6 +144,17 @@ const unsigned long ReceiveMessages[] PROGMEM = {/*126992L,*/ // System time
 // Forward declarations
 void HandleNMEA2000Msg(const tN2kMsg &N2kMsg);
 void SendNMEA0183Message(const tNMEA0183Msg &NMEA0183Msg);
+void loadWifiConfig();
+void startWifi();
+void factoryResetWifi();
+void longPressFactoryReset();
+void handle_ruuvi_labels_get();
+void handle_ruuvi_labels_set();
+void loadMqttConfig();
+void mqttReconnect();
+void mqttPublish();
+void handle_mqtt_config();
+void handle_mqtt_save();
 
 // Data wire for teperature (Dallas DS18B20) is plugged into GPIO 13 on the ESP32
 #define ONE_WIRE_BUS 13
@@ -133,8 +170,8 @@ WebServer webserver(80);
 
 // Battery voltage is connected GPIO 34 (Analog ADC1_CH6)
 const int ADCpin = 34;
-float voltage = 0;
-float temp = 0;
+
+tLocalSensors LocalSensors;
 
 // Task handle for OneWire read (Core 0 on ESP32)
 TaskHandle_t Task1;
@@ -162,6 +199,8 @@ void debug_log(char* str) {
 
 
 void setup() {
+pinMode(INTERNAL_LED, OUTPUT);
+digitalWrite(INTERNAL_LED, HIGH);
 
   uint8_t chipid[6];
   uint32_t id = 0;
@@ -172,6 +211,9 @@ void setup() {
   pinMode(buttonPin, INPUT_PULLUP);
 
   button.attachClick(clickedIt);
+  // Long-press factory reset is handled by a raw digitalRead() timer in loop()
+  // rather than OneButton, because the board uses activeLow=false which makes
+  // OneButton see the pulled-up pin as permanently pressed.
 
   // Init USB serial port
   Serial.begin(115200);
@@ -180,40 +222,13 @@ void setup() {
   Serial2.begin(baudrate, rs_config);
   NMEA0183.Begin(&Serial2, 3, baudrate);
 
-  if (WLAN_CLIENT == 1) {
-    Serial.println("Start WLAN Client");         // WiFi Mode Client
+  loadWifiConfig();
+  startWifi();
 
-    WiFi.config(CL_local_ip, CL_gateway, CL_subnet, CL_gateway);
-    delay(100);
-    WiFi.begin(CL_ssid, CL_password);
+  loadMqttConfig();
 
-    while (WiFi.status() != WL_CONNECTED  && wifi_retry < 20) {         // Check connection, try 10 seconds
-      wifi_retry++;
-      delay(500);
-      Serial.print(".");
-    }
-  }
-
-  if (WiFi.status() != WL_CONNECTED) {   // No client connection start AP
-    // Init wifi connection
-    Serial.println("Start WLAN AP");         // WiFi Mode AP
-    WiFi.mode(WIFI_AP);
-    WiFi.softAP(AP_ssid, AP_password);
-    delay(100);
-    WiFi.softAPConfig(AP_local_ip, AP_gateway, AP_subnet);
-    IPAddress IP = WiFi.softAPIP();
-    Serial.println("");
-    Serial.print("AP IP address: ");
-    Serial.println(IP);
-    wifiType = 1;
-
-  } else {  // Wifi Client connection was sucessfull
-
-    Serial.println("");
-    Serial.println("WiFi client connected");
-    Serial.println("IP client address: ");
-    Serial.println(WiFi.localIP());
-  }
+  // Start Ruuvi BLE scanner (passive, co-exists with WiFi)
+  ruuviInit();
 
   // Start OneWire
   sensors.begin();
@@ -226,9 +241,20 @@ void setup() {
 
 
   // Start Web Server
-  webserver.on("/", Ereignis_Index);
-  webserver.on("/gauge.min.js", Ereignis_js);
-  webserver.on("/ADC.txt", Ereignis_ADC);
+  webserver.on("/",               HTTP_GET,  Ereignis_Index);
+  webserver.on("/ADC.txt",        HTTP_GET,  Ereignis_ADC);
+  webserver.on("/data",           HTTP_GET,  handle_data_json);
+  webserver.on("/sw.js",          HTTP_GET,  handle_sw_js);
+  webserver.on("/leaflet.js",     HTTP_GET,  handle_leaflet_js);
+  webserver.on("/settings",       HTTP_GET,  handle_settings);
+  webserver.on("/api/status",     HTTP_GET,  handle_api_status);
+  webserver.on("/api/wifi/scan",  HTTP_GET,  handle_wifi_scan);
+  webserver.on("/api/wifi/save",  HTTP_POST, handle_wifi_save);
+  webserver.on("/api/wifi/reset",    HTTP_POST, handle_wifi_reset);
+  webserver.on("/api/ruuvi/labels",  HTTP_GET,  handle_ruuvi_labels_get);
+  webserver.on("/api/ruuvi/labels",  HTTP_POST, handle_ruuvi_labels_set);
+  webserver.on("/api/mqtt/config",   HTTP_GET,  handle_mqtt_config);
+  webserver.on("/api/mqtt/save",     HTTP_POST, handle_mqtt_save);
   webserver.onNotFound(handleNotFound);
 
   webserver.begin();
@@ -279,6 +305,7 @@ void setup() {
   NMEA2000.Open();
 
   // Create task for core 0, loop() runs on core 1
+ 
   xTaskCreatePinnedToCore(
     GetTemperature, /* Function to implement the task */
     "Task1", /* Name of the task */
@@ -287,19 +314,21 @@ void setup() {
     0,  /* Priority of the task */
     &Task1,  /* Task handle. */
     0); /* Core where the task should run */
-
   delay(200);
+      digitalWrite(INTERNAL_LED, LOW);
 }
 
 // This task runs isolated on core 0 because sensors.requestTemperatures() is slow and blocking for about 750 ms
 void GetTemperature( void * parameter) {
-  float tmp = 0;
+  float tmp = 12.3;
   for (;;) {
+    digitalWrite(INTERNAL_LED, HIGH);
     sensors.requestTemperatures(); // Send the command to get temperatures
     vTaskDelay(100);
-    tmp = sensors.getTempCByIndex(0);
-    if (tmp != -127) temp = tmp;
-    vTaskDelay(100);
+    //tmp = sensors.getTempCByIndex(0);
+    if (tmp != -127) LocalSensors.FridgeTemp = tmp;
+    vTaskDelay(250);
+    digitalWrite(INTERNAL_LED, LOW);
   }
 }
 
@@ -307,24 +336,419 @@ void GetTemperature( void * parameter) {
 
 void Ereignis_Index()    // Wenn "http://<ip address>/" aufgerufen wurde
 {
-  webserver.send(200, "text/html", indexHTML);  //dann Index Webseite senden
-}
-
-void Ereignis_js()      // Wenn "http://<ip address>/gauge.min.js" aufgerufen wurde
-{
-  webserver.send(200, "text/html", gauge);     // dann gauge.min.js senden
+  webserver.send_P(200, "text/html", indexHTML);
 }
 
 void Ereignis_ADC()     // Wenn "http://<ip address>/ADC.txt" aufgerufen wurde
 {
 
   webserver.sendHeader("Cache-Control", "no-cache");  // Sehr wichtig !!!!!!!!!!!!!!!!!!!
-  webserver.send(200, "text/plain", String (temp));   // dann text mit ADC Wert senden
+  webserver.send(200, "text/plain", String(LocalSensors.FridgeTemp));
+}
+
+void handle_sw_js()
+{
+  webserver.sendHeader("Cache-Control", "no-cache");
+  webserver.send(200, "application/javascript", swJS);
+}
+
+void handle_leaflet_js()
+{
+  webserver.sendHeader("Cache-Control", "public, max-age=604800"); // 1 week
+  webserver.sendHeader("Content-Encoding", "gzip");
+  webserver.send_P(200, "application/javascript", (const char*)leafletJS, leafletJSLen);
 }
 
 void handleNotFound()
 {
   webserver.send(404, "text/plain", "File Not Found\n\n");
+}
+
+// ── WiFi configuration ────────────────────────────────────────────────────────
+
+void loadWifiConfig() {
+  preferences.begin("wifi_cfg", true);
+  wifiMode = preferences.getUChar("mode", 0);
+  String s;
+  s = preferences.getString("ap_ssid", "NMEA2000-GW"); strlcpy(apSsid,  s.c_str(), sizeof(apSsid));
+  s = preferences.getString("ap_pass", "nmea2000");    strlcpy(apPass,  s.c_str(), sizeof(apPass));
+  s = preferences.getString("sta_ssid", "");           strlcpy(staSsid, s.c_str(), sizeof(staSsid));
+  s = preferences.getString("sta_pass", "");           strlcpy(staPass, s.c_str(), sizeof(staPass));
+  preferences.end();
+  Serial.printf("WiFi config: mode=%d ap=%s sta=%s\n", wifiMode, apSsid, staSsid);
+}
+
+void startWifi() {
+  WiFi.disconnect(true);
+  delay(100);
+
+  bool doAP  = (wifiMode == 0 || wifiMode == 2);
+  bool doSTA = (wifiMode == 1 || wifiMode == 2);
+
+  if      (doAP && doSTA) WiFi.mode(WIFI_AP_STA);
+  else if (doSTA)         WiFi.mode(WIFI_STA);
+  else                    WiFi.mode(WIFI_AP);
+
+  if (doAP) {
+    if (strlen(apPass) >= 8)
+      WiFi.softAP(apSsid, apPass);
+    else
+      WiFi.softAP(apSsid);           // open network
+    delay(100);
+    WiFi.softAPConfig(AP_local_ip, AP_gateway, AP_subnet);
+    Serial.printf("AP started: %s  IP: %s\n", apSsid, WiFi.softAPIP().toString().c_str());
+    strlcpy(udpAddress, "192.168.15.255", sizeof(udpAddress));
+  }
+
+  if (doSTA && strlen(staSsid) > 0) {
+    WiFi.begin(staSsid, staPass);
+    int retries = 0;
+    Serial.printf("Connecting to %s", staSsid);
+    while (WiFi.status() != WL_CONNECTED && retries < 20) {
+      delay(500); Serial.print("."); retries++;
+    }
+    Serial.println();
+    if (WiFi.status() == WL_CONNECTED) {
+      staConnected = true;
+      Serial.printf("STA connected  IP: %s\n", WiFi.localIP().toString().c_str());
+      strlcpy(udpAddress, "255.255.255.255", sizeof(udpAddress));
+    } else {
+      Serial.println("STA connection failed");
+      if (wifiMode == 1) {
+        // STA-only but no connection — fall back to AP so user can reconfigure
+        WiFi.mode(WIFI_AP);
+        if (strlen(apPass) >= 8) WiFi.softAP(apSsid, apPass); else WiFi.softAP(apSsid);
+        delay(100);
+        WiFi.softAPConfig(AP_local_ip, AP_gateway, AP_subnet);
+        Serial.printf("Fallback AP: %s\n", WiFi.softAPIP().toString().c_str());
+        strlcpy(udpAddress, "192.168.15.255", sizeof(udpAddress));
+      }
+    }
+  }
+
+  if (MDNS.begin("nmea2000")) {
+    MDNS.addService("http", "tcp", 80);
+    Serial.println("mDNS: nmea2000.local");
+  }
+}
+
+void factoryResetWifi() {
+  Serial.println("Factory reset: clearing wifi_cfg");
+  preferences.begin("wifi_cfg", false);
+  preferences.clear();
+  preferences.end();
+}
+
+void longPressFactoryReset() {
+  factoryResetWifi();
+  // Three short buzzes to confirm
+  for (int i = 0; i < 3; i++) {
+    digitalWrite(buzzerPin, HIGH); delay(120);
+    digitalWrite(buzzerPin, LOW);  delay(120);
+  }
+  delay(200);
+  ESP.restart();
+}
+
+// ── Settings web handlers ─────────────────────────────────────────────────────
+
+void handle_settings() {
+  webserver.send_P(200, "text/html", settingsHTML);
+}
+
+void handle_api_status() {
+  JsonDocument doc;
+  doc["mode"]          = wifiMode;
+  doc["ap_ssid"]       = apSsid;
+  doc["ap_ip"]         = WiFi.softAPIP().toString();
+  doc["sta_ssid"]      = staSsid;
+  doc["sta_connected"] = staConnected;
+  doc["sta_ip"]        = WiFi.localIP().toString();
+  String out; serializeJson(doc, out);
+  webserver.sendHeader("Cache-Control", "no-cache");
+  webserver.sendHeader("Access-Control-Allow-Origin", "*");
+  webserver.send(200, "application/json", out);
+}
+
+void handle_wifi_scan() {
+  int n = WiFi.scanNetworks();
+  JsonDocument doc;
+  JsonArray nets = doc["networks"].to<JsonArray>();
+  for (int i = 0; i < n && i < 20; i++) {
+    JsonObject obj = nets.add<JsonObject>();
+    obj["ssid"]   = WiFi.SSID(i);
+    obj["rssi"]   = WiFi.RSSI(i);
+    obj["secure"] = (WiFi.encryptionType(i) != WIFI_AUTH_OPEN);
+  }
+  WiFi.scanDelete();
+  String out; serializeJson(doc, out);
+  webserver.sendHeader("Cache-Control", "no-cache");
+  webserver.sendHeader("Access-Control-Allow-Origin", "*");
+  webserver.send(200, "application/json", out);
+}
+
+void handle_wifi_save() {
+  if (!webserver.hasArg("plain")) {
+    webserver.send(400, "application/json", "{\"ok\":false,\"error\":\"no body\"}");
+    return;
+  }
+  JsonDocument doc;
+  if (deserializeJson(doc, webserver.arg("plain"))) {
+    webserver.send(400, "application/json", "{\"ok\":false,\"error\":\"bad json\"}");
+    return;
+  }
+  uint8_t mode = doc["mode"] | 0;
+  if (mode > 2) mode = 0;
+
+  preferences.begin("wifi_cfg", false);
+  preferences.putUChar("mode", mode);
+  // Only overwrite credentials when the user supplied a non-empty value so
+  // leaving the password field blank preserves the existing stored password.
+  String v;
+  v = doc["ap_ssid"] | ""; if (v.length() > 0) preferences.putString("ap_ssid", v);
+  v = doc["ap_pass"]  | ""; if (v.length() > 0) preferences.putString("ap_pass",  v);
+  v = doc["sta_ssid"] | ""; preferences.putString("sta_ssid", v); // allow clearing
+  v = doc["sta_pass"]  | ""; if (v.length() > 0) preferences.putString("sta_pass",  v);
+  preferences.end();
+
+  webserver.sendHeader("Cache-Control", "no-cache");
+  webserver.sendHeader("Access-Control-Allow-Origin", "*");
+  webserver.send(200, "application/json", "{\"ok\":true}");
+  delay(500);
+  ESP.restart();
+}
+
+void handle_wifi_reset() {
+  factoryResetWifi();
+  webserver.sendHeader("Cache-Control", "no-cache");
+  webserver.sendHeader("Access-Control-Allow-Origin", "*");
+  webserver.send(200, "application/json", "{\"ok\":true}");
+  delay(500);
+  ESP.restart();
+}
+
+// ── Ruuvi label handlers ──────────────────────────────────────────────────────
+
+void handle_ruuvi_labels_get() {
+  JsonDocument doc;
+  JsonArray arr = doc["sensors"].to<JsonArray>();
+  tRuuviSensor snap[RUUVI_MAX_SENSORS];
+  if (ruuviMutex && xSemaphoreTake(ruuviMutex, pdMS_TO_TICKS(50)) == pdTRUE) {
+    memcpy(snap, ruuviSensors, sizeof(snap));
+    xSemaphoreGive(ruuviMutex);
+  } else {
+    memcpy(snap, ruuviSensors, sizeof(snap));
+  }
+  for (int i = 0; i < RUUVI_MAX_SENSORS; i++) {
+    JsonObject o = arr.add<JsonObject>();
+    o["slot"]   = i;
+    o["active"] = snap[i].active;
+    o["mac"]    = snap[i].mac;
+    o["label"]  = snap[i].label;
+    o["stale"]  = ruuviIsStale(i);
+  }
+  String out; serializeJson(doc, out);
+  webserver.sendHeader("Cache-Control", "no-cache");
+  webserver.sendHeader("Access-Control-Allow-Origin", "*");
+  webserver.send(200, "application/json", out);
+}
+
+void handle_ruuvi_labels_set() {
+  if (!webserver.hasArg("plain")) {
+    webserver.send(400, "application/json", "{\"ok\":false,\"error\":\"no body\"}");
+    return;
+  }
+  JsonDocument doc;
+  if (deserializeJson(doc, webserver.arg("plain"))) {
+    webserver.send(400, "application/json", "{\"ok\":false,\"error\":\"bad json\"}");
+    return;
+  }
+  for (JsonObject o : doc["sensors"].as<JsonArray>()) {
+    int slot = o["slot"] | -1;
+    const char* lbl = o["label"] | "";
+    if (slot >= 0 && slot < RUUVI_MAX_SENSORS && strlen(lbl) > 0)
+      ruuviSaveLabel(slot, lbl);
+  }
+  webserver.sendHeader("Cache-Control", "no-cache");
+  webserver.sendHeader("Access-Control-Allow-Origin", "*");
+  webserver.send(200, "application/json", "{\"ok\":true}");
+}
+
+
+// ── MQTT ─────────────────────────────────────────────────────────────────────
+
+void loadMqttConfig() {
+  Preferences prefs;
+  prefs.begin("mqtt_cfg", true);
+  mqttEnabled = prefs.getBool("enabled", false);
+  mqttPort    = prefs.getUShort("port", 8883);
+  String s;
+  s = prefs.getString("host",  ""); strlcpy(mqttHost,  s.c_str(), sizeof(mqttHost));
+  s = prefs.getString("user",  ""); strlcpy(mqttUser,  s.c_str(), sizeof(mqttUser));
+  s = prefs.getString("pass",  ""); strlcpy(mqttPass,  s.c_str(), sizeof(mqttPass));
+  s = prefs.getString("topic", "boat/myyacht"); strlcpy(mqttTopic, s.c_str(), sizeof(mqttTopic));
+  prefs.end();
+  Serial.printf("MQTT config: enabled=%d host=%s\n", mqttEnabled, mqttHost);
+}
+
+void mqttReconnect() {
+  if (strlen(mqttHost) == 0) return;
+  static unsigned long lastAttempt = 0;
+  if (millis() - lastAttempt < 30000) return;  // back-off: retry every 30 s
+  lastAttempt = millis();
+
+  // Lazy-create so TLS context only allocates heap when MQTT is actually enabled
+  if (!mqttTlsClient) mqttTlsClient = new WiFiClientSecure();
+  if (!mqttClient)    mqttClient    = new PubSubClient(*mqttTlsClient);
+
+  mqttTlsClient->setInsecure();  // encrypt but skip cert verification
+  mqttClient->setServer(mqttHost, mqttPort);
+  mqttClient->setKeepAlive(60);
+  mqttClient->setSocketTimeout(10);
+
+  char clientId[32];
+  uint8_t mac[6]; WiFi.macAddress(mac);
+  snprintf(clientId, sizeof(clientId), "nmea-gw-%02X%02X", mac[4], mac[5]);
+
+  Serial.printf("MQTT connecting to %s as %s\n", mqttHost, clientId);
+  if (mqttClient->connect(clientId, mqttUser, mqttPass)) {
+    mqttConnected = true;
+    Serial.println("MQTT connected");
+    char statusTopic[96];
+    snprintf(statusTopic, sizeof(statusTopic), "%s/status", mqttTopic);
+    mqttClient->publish(statusTopic, "online", true);
+  } else {
+    mqttConnected = false;
+    Serial.printf("MQTT failed, rc=%d\n", mqttClient->state());
+  }
+}
+
+void mqttPublish() {
+  if (!mqttClient || !mqttClient->connected()) return;
+
+  // Build full telemetry JSON — same fields as /data plus Ruuvi array
+  JsonDocument doc;
+
+#ifdef USE_MOCK_DATA
+  doc["dataSource"]       = "mock";
+  doc["Latitude"]         = MOCK_LATITUDE;
+  doc["Longitude"]        = MOCK_LONGITUDE;
+  doc["Heading"]          = MOCK_HEADING;
+  doc["COG"]              = MOCK_COG;
+  doc["SOG"]              = MOCK_SOG;
+  doc["STW"]              = MOCK_STW;
+  doc["AWS"]              = MOCK_AWS;
+  doc["TWS"]              = MOCK_TWS;
+  doc["AWA"]              = MOCK_AWA;
+  doc["TWA"]              = MOCK_TWA;
+  doc["TWD"]              = MOCK_TWD;
+  doc["WaterDepth"]       = MOCK_WATER_DEPTH;
+  doc["WaterTemperature"] = MOCK_WATER_TEMP;
+#else
+  doc["dataSource"]       = "live";
+  doc["Latitude"]         = BoatData.Latitude;
+  doc["Longitude"]        = BoatData.Longitude;
+  doc["Heading"]          = BoatData.Heading;
+  doc["COG"]              = BoatData.COG;
+  doc["SOG"]              = BoatData.SOG;
+  doc["STW"]              = BoatData.STW;
+  doc["AWS"]              = BoatData.AWS;
+  doc["TWS"]              = BoatData.TWS;
+  doc["AWA"]              = BoatData.AWA;
+  doc["TWA"]              = BoatData.TWA;
+  doc["TWD"]              = BoatData.TWD;
+  doc["WaterDepth"]       = BoatData.WaterDepth;
+  doc["WaterTemperature"] = BoatData.WaterTemperature;
+#endif
+
+  doc["FridgeTemperature"] = LocalSensors.FridgeTemp;
+  doc["BatteryVoltage"]    = LocalSensors.BatteryVoltage;
+  doc["timestamp"]         = millis() / 1000;  // seconds since boot
+
+  // Ruuvi sensors
+  {
+    tRuuviSensor snap[RUUVI_MAX_SENSORS];
+    if (ruuviMutex && xSemaphoreTake(ruuviMutex, pdMS_TO_TICKS(50)) == pdTRUE) {
+      memcpy(snap, ruuviSensors, sizeof(snap));
+      xSemaphoreGive(ruuviMutex);
+    } else {
+      memcpy(snap, ruuviSensors, sizeof(snap));
+    }
+    JsonArray arr = doc["ruuvi"].to<JsonArray>();
+    for (int i = 0; i < RUUVI_MAX_SENSORS; i++) {
+      bool stale = ruuviIsStale(i);
+      if (!snap[i].active || stale) continue;
+      JsonObject sr = arr.add<JsonObject>();
+      sr["label"] = snap[i].label;
+      sr["mac"]   = snap[i].mac;
+      if (!isnan(snap[i].temperature)) sr["temp"] = snap[i].temperature;
+      if (!isnan(snap[i].humidity))    sr["hum"]  = snap[i].humidity;
+      if (!isnan(snap[i].pressure))    sr["pres"] = snap[i].pressure;
+      if (snap[i].batteryMv > 0)       sr["batt"] = snap[i].batteryMv;
+      sr["rssi"]     = snap[i].rssi;
+      sr["movement"] = snap[i].movementCounter;
+      if (!isnan(snap[i].heel))  sr["heel"]  = snap[i].heel;
+      if (!isnan(snap[i].pitch)) sr["pitch"] = snap[i].pitch;
+    }
+  }
+
+  char pubTopic[96];
+  snprintf(pubTopic, sizeof(pubTopic), "%s/telemetry", mqttTopic);
+
+  String payload;
+  serializeJson(doc, payload);
+
+  mqttClient->setBufferSize(1024);
+  if (!mqttClient->publish(pubTopic, payload.c_str())) {
+    Serial.println("MQTT publish failed (payload too large?)");
+  }
+}
+
+void handle_mqtt_config() {
+  JsonDocument doc;
+  doc["enabled"]   = mqttEnabled;
+  doc["host"]      = mqttHost;
+  doc["port"]      = mqttPort;
+  doc["user"]      = mqttUser;
+  doc["topic"]     = mqttTopic;
+  doc["connected"] = mqttConnected && mqttClient && mqttClient->connected();
+  String out; serializeJson(doc, out);
+  webserver.sendHeader("Cache-Control", "no-cache");
+  webserver.sendHeader("Access-Control-Allow-Origin", "*");
+  webserver.send(200, "application/json", out);
+}
+
+void handle_mqtt_save() {
+  if (!webserver.hasArg("plain")) {
+    webserver.send(400, "application/json", "{\"ok\":false,\"error\":\"no body\"}");
+    return;
+  }
+  JsonDocument doc;
+  if (deserializeJson(doc, webserver.arg("plain"))) {
+    webserver.send(400, "application/json", "{\"ok\":false,\"error\":\"bad json\"}");
+    return;
+  }
+  mqttEnabled = doc["enabled"] | false;
+  mqttPort    = doc["port"]    | 8883;
+
+  Preferences prefs;
+  prefs.begin("mqtt_cfg", false);
+  prefs.putBool("enabled", mqttEnabled);
+  prefs.putUShort("port", mqttPort);
+  String v;
+  v = doc["host"]  | ""; if (v.length() > 0) { strlcpy(mqttHost,  v.c_str(), sizeof(mqttHost));  prefs.putString("host",  v); }
+  v = doc["user"]  | ""; if (v.length() > 0) { strlcpy(mqttUser,  v.c_str(), sizeof(mqttUser));  prefs.putString("user",  v); }
+  v = doc["pass"]  | ""; if (v.length() > 0) { strlcpy(mqttPass,  v.c_str(), sizeof(mqttPass));  prefs.putString("pass",  v); }
+  v = doc["topic"] | ""; if (v.length() > 0) { strlcpy(mqttTopic, v.c_str(), sizeof(mqttTopic)); prefs.putString("topic", v); }
+  prefs.end();
+
+  // Disconnect so mqttReconnect() picks up the new credentials on next loop tick
+  if (mqttClient) mqttClient->disconnect();
+  mqttConnected = false;
+
+  webserver.sendHeader("Cache-Control", "no-cache");
+  webserver.sendHeader("Access-Control-Allow-Origin", "*");
+  webserver.send(200, "application/json", "{\"ok\":true}");
 }
 
 
@@ -380,11 +804,80 @@ void SendN2kEngine() {
   if ( IsTimeToUpdate(SlowDataUpdated) ) {
     SetNextUpdate(SlowDataUpdated, SlowDataUpdatePeriod);
 
-    SetN2kEngineDynamicParam(N2kMsg, 0, N2kDoubleNA, N2kDoubleNA, CToKelvin(temp), voltage, N2kDoubleNA, N2kDoubleNA, N2kDoubleNA, N2kDoubleNA, N2kInt8NA, N2kInt8NA, true);
+    SetN2kEngineDynamicParam(N2kMsg, 0, N2kDoubleNA, N2kDoubleNA, CToKelvin(LocalSensors.FridgeTemp), LocalSensors.BatteryVoltage, N2kDoubleNA, N2kDoubleNA, N2kDoubleNA, N2kDoubleNA, N2kInt8NA, N2kInt8NA, true);
     NMEA2000.SendMsg(N2kMsg);
   }
 }
 
+
+String addNMEAChecksum(const String &sentence) {
+  byte checksum = 0;
+  for (size_t i = 0; i < sentence.length(); i++) checksum ^= (byte)sentence[i];
+  char buf[8];
+  sprintf(buf, "*%02X\r\n", checksum);
+  return "$" + sentence + String(buf);
+}
+
+#ifdef USE_MOCK_DATA
+void SendHardcodedNMEA() {
+  static unsigned long nextSend = 0;
+  if (millis() < nextSend) return;
+  nextSend = millis() + 1000;
+
+  // Mirror MockData constants into BoatData so the /data endpoint and the UDP
+  // NMEA broadcast stay in sync.  All values come from MockData.h — edit there.
+  BoatData.Latitude         = MOCK_LATITUDE;
+  BoatData.Longitude        = MOCK_LONGITUDE;
+  BoatData.Heading          = MOCK_HEADING;
+  BoatData.COG              = MOCK_COG;
+  BoatData.SOG              = MOCK_SOG;
+  BoatData.STW              = MOCK_STW;
+  BoatData.TWD              = MOCK_TWD;
+  BoatData.TWS              = MOCK_TWS;
+  BoatData.TWA              = MOCK_TWA;
+  BoatData.AWS              = MOCK_AWS;
+  BoatData.AWA              = MOCK_AWA;
+  BoatData.WaterDepth       = MOCK_WATER_DEPTH;
+  BoatData.WaterTemperature = MOCK_WATER_TEMP;
+  BoatData.RudderPosition   = MOCK_RUDDER_POSITION;
+  BoatData.TripLog          = MOCK_TRIP_LOG;
+  BoatData.Log              = MOCK_TOTAL_LOG;
+  BoatData.GPSTime          = MOCK_GPS_TIME;
+  BoatData.Variation        = MOCK_VARIATION;
+
+  // Build NMEA sentences from the same constants so UDP output stays in sync
+  int    latD = (int)fabs(MOCK_LATITUDE);
+  float  latM = (fabs(MOCK_LATITUDE) - latD) * 60.0f;
+  int    lonD = (int)fabs(MOCK_LONGITUDE);
+  float  lonM = (fabs(MOCK_LONGITUDE) - lonD) * 60.0f;
+  char   latS[10], lonS[11];
+  snprintf(latS, sizeof(latS), "%02d%05.2f", latD, latM);
+  snprintf(lonS, sizeof(lonS), "%03d%05.2f", lonD, lonM);
+  char   latH = MOCK_LATITUDE  >= 0 ? 'N' : 'S';
+  char   lonH = MOCK_LONGITUDE >= 0 ? 'E' : 'W';
+
+  char rmcBuf[80], vtgBuf[60], mwvRBuf[40], mwvTBuf[40], dbtBuf[50], xdrBuf[40];
+  snprintf(rmcBuf,  sizeof(rmcBuf),  "GPRMC,120000.00,A,%s,%c,%s,%c,%.1f,%.1f,140526,,",
+           latS, latH, lonS, lonH, (float)MOCK_SOG, (float)MOCK_COG);
+  snprintf(vtgBuf,  sizeof(vtgBuf),  "GPVTG,%.1f,T,,M,%.1f,N,%.2f,K,A",
+           (float)MOCK_COG, (float)MOCK_SOG, (float)(MOCK_SOG * 1.852));
+  snprintf(mwvRBuf, sizeof(mwvRBuf), "WIMWV,%.1f,R,%.1f,N,A", (float)MOCK_AWA, (float)MOCK_AWS);
+  snprintf(mwvTBuf, sizeof(mwvTBuf), "WIMWV,%.1f,T,%.1f,N,A", (float)MOCK_TWA, (float)MOCK_TWS);
+  snprintf(dbtBuf,  sizeof(dbtBuf),  "SDDBT,%.2f,f,%.2f,M,%.2f,F",
+           (float)(MOCK_WATER_DEPTH * 3.28084), (float)MOCK_WATER_DEPTH,
+           (float)(MOCK_WATER_DEPTH * 0.546807));
+  snprintf(xdrBuf,  sizeof(xdrBuf),  "IIXDR,C,%.2f,C,FRIDGE", LocalSensors.FridgeTemp);
+
+  udp.beginPacket(udpAddress, udpPort);
+  udp.print(addNMEAChecksum(String(rmcBuf)));
+  udp.print(addNMEAChecksum(String(vtgBuf)));
+  udp.print(addNMEAChecksum(String(mwvRBuf)));
+  udp.print(addNMEAChecksum(String(mwvTBuf)));
+  udp.print(addNMEAChecksum(String(dbtBuf)));
+  udp.print(addNMEAChecksum(String(xdrBuf)));
+  udp.endPacket();
+}
+#endif // USE_MOCK_DATA
 
 //*****************************************************************************
 void AddClient(WiFiClient &client) {
@@ -450,8 +943,7 @@ void handle_json() {
   while (client.available()) client.read();
 
   // Allocate JsonBuffer
-  // Use arduinojson.org/assistant to compute the capacity.
-  StaticJsonDocument<800> root;
+  JsonDocument root;
 
   root["Latitude"] = BoatData.Latitude;
   root["Longitude"] = BoatData.Longitude;
@@ -475,8 +967,8 @@ void handle_json() {
   root["Altitude"] = BoatData.Altitude;
   root["GPSTime"] = BoatData.GPSTime;
   root["DaysSince1970"] = BoatData.DaysSince1970;
-  root["FridgeTeperature"] = temp;
-  root["BatteryVoltage"] = voltage;
+  root["FridgeTemperature"] = LocalSensors.FridgeTemp;
+  root["BatteryVoltage"]    = LocalSensors.BatteryVoltage;
 
 
   //Serial.print(F("Sending: "));
@@ -497,8 +989,117 @@ void handle_json() {
 }
 
 
+// JSON endpoint on the main WebServer (port 80, route /data).
+// In mock mode: reads directly from MockData.h constants so floating CAN GPIO
+// pins (noise on the TWAI controller) cannot overwrite the values.
+// In live mode: reads from BoatData (populated by tN2kDataToNMEA0183) and
+// LocalSensors (on-board DS18B20 + ADC).  Local sensors always use real hardware.
+void handle_data_json() {
+  JsonDocument root;
+
+#ifdef USE_MOCK_DATA
+  root["Latitude"]         = MOCK_LATITUDE;
+  root["Longitude"]        = MOCK_LONGITUDE;
+  root["Heading"]          = MOCK_HEADING;
+  root["COG"]              = MOCK_COG;
+  root["SOG"]              = MOCK_SOG;
+  root["STW"]              = MOCK_STW;
+  root["AWS"]              = MOCK_AWS;
+  root["TWS"]              = MOCK_TWS;
+  root["AWA"]              = MOCK_AWA;
+  root["TWA"]              = MOCK_TWA;
+  root["TWD"]              = MOCK_TWD;
+  root["MaxAws"]           = MOCK_AWS;
+  root["MaxTws"]           = MOCK_TWS;
+  root["TripLog"]          = MOCK_TRIP_LOG;
+  root["Log"]              = MOCK_TOTAL_LOG;
+  root["RudderPosition"]   = MOCK_RUDDER_POSITION;
+  root["WaterTemperature"] = MOCK_WATER_TEMP;
+  root["WaterDepth"]       = MOCK_WATER_DEPTH;
+  root["Variation"]        = MOCK_VARIATION;
+  root["Altitude"]         = 0.0;
+  root["GPSTime"]          = MOCK_GPS_TIME;
+  root["DaysSince1970"]    = 0.0;
+  root["dataSource"]       = "mock";
+  root["gpsValid"]         = 1;
+  root["windValid"]        = 1;
+  root["depthValid"]       = 1;
+  root["localValid"]       = 1;
+#else
+  root["Latitude"]         = BoatData.Latitude;
+  root["Longitude"]        = BoatData.Longitude;
+  root["Heading"]          = BoatData.Heading;
+  root["COG"]              = BoatData.COG;
+  root["SOG"]              = BoatData.SOG;
+  root["STW"]              = BoatData.STW;
+  root["AWS"]              = BoatData.AWS;
+  root["TWS"]              = BoatData.TWS;
+  root["AWA"]              = BoatData.AWA;
+  root["TWA"]              = BoatData.TWA;
+  root["TWD"]              = BoatData.TWD;
+  root["MaxAws"]           = BoatData.MaxAws;
+  root["MaxTws"]           = BoatData.MaxTws;
+  root["TripLog"]          = BoatData.TripLog;
+  root["Log"]              = BoatData.Log;
+  root["RudderPosition"]   = BoatData.RudderPosition;
+  root["WaterTemperature"] = BoatData.WaterTemperature;
+  root["WaterDepth"]       = BoatData.WaterDepth;
+  root["Variation"]        = BoatData.Variation;
+  root["Altitude"]         = BoatData.Altitude;
+  root["GPSTime"]          = BoatData.GPSTime;
+  root["DaysSince1970"]    = BoatData.DaysSince1970;
+  root["dataSource"]       = "live";
+  root["gpsValid"]         = (fabs(BoatData.Latitude) > 0.001 || fabs(BoatData.Longitude) > 0.001) ? 1 : 0;
+  root["windValid"]        = (BoatData.AWS > 0.01 || BoatData.TWS > 0.01) ? 1 : 0;
+  root["depthValid"]       = (BoatData.WaterDepth > 0.01) ? 1 : 0;
+  root["localValid"]       = (LocalSensors.BatteryVoltage > 0.01) ? 1 : 0;
+#endif
+
+  // Local sensors always come from real on-board hardware regardless of mode
+  root["FridgeTemperature"] = LocalSensors.FridgeTemp;
+  root["BatteryVoltage"]    = LocalSensors.BatteryVoltage;
+
+  // Ruuvi BLE sensors — snapshot under mutex
+  {
+    tRuuviSensor snap[RUUVI_MAX_SENSORS];
+    if (ruuviMutex && xSemaphoreTake(ruuviMutex, pdMS_TO_TICKS(50)) == pdTRUE) {
+      memcpy(snap, ruuviSensors, sizeof(snap));
+      xSemaphoreGive(ruuviMutex);
+    } else {
+      memcpy(snap, ruuviSensors, sizeof(snap));
+    }
+    JsonArray arr = root["ruuvi"].to<JsonArray>();
+    for (int i = 0; i < RUUVI_MAX_SENSORS; i++) {
+      JsonObject sr = arr.add<JsonObject>();
+      bool stale = ruuviIsStale(i);
+      sr["active"] = snap[i].active;
+      sr["stale"]  = stale;
+      sr["label"]  = snap[i].label;
+      sr["mac"]    = snap[i].mac;
+      if (snap[i].active && !stale) {
+        if (!isnan(snap[i].temperature)) sr["temp"] = snap[i].temperature;
+        if (!isnan(snap[i].humidity))    sr["hum"]  = snap[i].humidity;
+        if (!isnan(snap[i].pressure))    sr["pres"] = snap[i].pressure;
+        if (snap[i].batteryMv > 0)       sr["batt"] = snap[i].batteryMv;
+        sr["rssi"]     = snap[i].rssi;
+        sr["movement"] = snap[i].movementCounter;
+        if (!isnan(snap[i].heel))  sr["heel"]  = snap[i].heel;
+        if (!isnan(snap[i].pitch))  sr["pitch"] = snap[i].pitch;
+      }
+    }
+  }
+
+  String output;
+  serializeJson(root, output);
+  webserver.sendHeader("Cache-Control", "no-cache");
+  webserver.sendHeader("Access-Control-Allow-Origin", "*");
+  webserver.send(200, "application/json", output);
+}
+
 
 void loop() {
+digitalWrite(INTERNAL_LED, HIGH);
+
   unsigned int size;
   int wifi_retry;
 
@@ -523,9 +1124,41 @@ void loop() {
 #endif
   }
 
-  voltage = ((voltage * 15) + (ReadVoltage(ADCpin) * ADC_Calibration_Value / 4096)) / 16; // This implements a low pass filter to eliminate spike for ADC readings
+  LocalSensors.BatteryVoltage = ((LocalSensors.BatteryVoltage * 15) + (ReadVoltage(ADCpin) * ADC_Calibration_Value / 4096)) / 16; // low-pass filter to eliminate ADC spikes
 
   SendN2kEngine();
+  // Send Ruuvi environmental data to NMEA2000 bus every 10 s
+  {
+    static unsigned long lastRuuviN2k = 0;
+    if (millis() - lastRuuviN2k >= 10000) {
+      lastRuuviN2k = millis();
+      tRuuviSensor snap[RUUVI_MAX_SENSORS];
+      if (ruuviMutex && xSemaphoreTake(ruuviMutex, pdMS_TO_TICKS(50)) == pdTRUE) {
+        memcpy(snap, ruuviSensors, sizeof(snap));
+        xSemaphoreGive(ruuviMutex);
+        tN2kMsg msg;
+        for (int i = 0; i < RUUVI_MAX_SENSORS; i++) {
+          if (!snap[i].active || ruuviIsStale(i)) continue;
+          uint8_t inst = 10 + i;
+          if (!isnan(snap[i].temperature)) {
+            SetN2kTemperature(msg, 0xFF, inst, N2kts_MainCabinTemperature, CToKelvin(snap[i].temperature));
+            NMEA2000.SendMsg(msg);
+          }
+          if (!isnan(snap[i].humidity)) {
+            SetN2kHumidity(msg, 0xFF, inst, N2khs_InsideHumidity, snap[i].humidity);
+            NMEA2000.SendMsg(msg);
+          }
+          if (!isnan(snap[i].pressure)) {
+            SetN2kPressure(msg, 0xFF, inst, N2kps_Atmospheric, snap[i].pressure * 100.0f);
+            NMEA2000.SendMsg(msg);
+          }
+        }
+      }
+    }
+  }
+#ifdef USE_MOCK_DATA
+  SendHardcodedNMEA();
+#endif
   CheckConnections();
   NMEA2000.ParseMessages();
 
@@ -545,17 +1178,31 @@ void loop() {
     Serial.read();
   }
 
+  // Factory reset: physical button held LOW for 5 seconds.
+  // Read directly because OneButton is configured activeLow=false (inverted),
+  // so OneButton's long-press API would misfire on the pulled-up idle state.
+  {
+    static unsigned long btnHeldMs = 0;
+    static bool btnActive = false;
+    if (digitalRead(buttonPin) == LOW) {
+      if (!btnActive) { btnHeldMs = millis(); btnActive = true; }
+      else if (millis() - btnHeldMs >= 5000) { longPressFactoryReset(); }
+    } else {
+      btnActive = false;
+    }
+  }
+
   // Alarm handling
   button.tick();
 
 #if ENABLE_DEBUG_LOG == 2
-  Serial.print("Voltage:" ); Serial.println(voltage);
-  //Serial.print("Temperature: ");Serial.println(temp);
+  Serial.print("Voltage:"); Serial.println(LocalSensors.BatteryVoltage);
+  Serial.print("Temperature: "); Serial.println(LocalSensors.FridgeTemp);
   Serial.println("");
 #endif
 
   alarmstate = false;
-  if (temp > HighTempAlarm || voltage < LowVoltageAlarm) {
+  if (LocalSensors.FridgeTemp > HighTempAlarm || LocalSensors.BatteryVoltage < LowVoltageAlarm) {
     alarmstate = true;
   }
   if (alarmstate == true && acknowledge == false) {
@@ -564,20 +1211,31 @@ void loop() {
     digitalWrite(buzzerPin, LOW);
   }
 
-  if (wifiType == 0) {                                          // Check connection if working as client
-    wifi_retry = 0;
-    while (WiFi.status() != WL_CONNECTED && wifi_retry < 5 ) {  // Connection lost, 5 tries to reconnect
-      wifi_retry++;
-      Serial.println("WiFi not connected. Try to reconnect");
-      WiFi.disconnect();
-      WiFi.mode(WIFI_OFF);
-      WiFi.mode(WIFI_STA);
-      WiFi.begin(CL_ssid, CL_password);
-      delay(100);
-    }
-    if (wifi_retry >= 5) {
-      Serial.println("\nReboot");                                  // Did not work -> restart ESP32
-      ESP.restart();
+  // MQTT — keep connection alive and publish telemetry every 10 s
+  if (mqttEnabled && (wifiMode == 1 || wifiMode == 2) && staConnected) {
+    if (!mqttClient || !mqttClient->connected()) mqttReconnect();
+    if (mqttClient && mqttClient->connected()) {
+      mqttClient->loop();
+      static unsigned long lastMqttPub = 0;
+      if (millis() - lastMqttPub >= 60000) { lastMqttPub = millis(); mqttPublish(); }
     }
   }
+
+  // Monitor STA connection and attempt reconnect if lost
+  if ((wifiMode == 1 || wifiMode == 2) && strlen(staSsid) > 0) {
+    staConnected = (WiFi.status() == WL_CONNECTED);
+    if (!staConnected) {
+      wifi_retry = 0;
+      while (WiFi.status() != WL_CONNECTED && wifi_retry < 5) {
+        wifi_retry++;
+        Serial.println("WiFi STA reconnecting...");
+        WiFi.disconnect();
+        WiFi.begin(staSsid, staPass);
+        delay(500);
+      }
+      staConnected = (WiFi.status() == WL_CONNECTED);
+    }
+  }
+  delay(250);
+  digitalWrite(INTERNAL_LED, LOW);
 }

@@ -1,0 +1,34 @@
+OpenMarine Gateway Platform
+Copyright 2026 Nicholas Goodall and contributors
+
+Licensed under the Apache License, Version 2.0. See LICENSE for full terms.
+
+-------------------------------------------------------------------------------
+THIRD-PARTY COMPONENTS
+-------------------------------------------------------------------------------
+
+The proof-of-concept source files in Wifi-Serial-AP-AIS-CAN/ are derived from
+the NMEA2000 WiFi Gateway by Andreas Kirmse (AK-Homberger) and retain their
+original license headers (GNU Lesser General Public License v2.1 or later).
+
+  Original project:  https://github.com/AK-Homberger/NMEA2000WifiGateway-with-ESP32
+  Also published at: https://open-boat-projects.org/en/nmea2000-with-wi-fi-and-nmea-0183-and-can-bus/
+  Original author:   Andreas Kirmse (https://github.com/AK-Homberger)
+  Original license:  GNU Lesser General Public License v2.1 or later (LGPL-2.1+)
+
+New source files outside Wifi-Serial-AP-AIS-CAN/ are original work licensed
+under Apache 2.0 and carry the SPDX header:
+  // SPDX-License-Identifier: Apache-2.0
+
+-------------------------------------------------------------------------------
+
+The NMEA2000 and NMEA0183 libraries are the work of Timo Lappalainen and are
+used under their respective licenses:
+  https://github.com/ttlappalainen/NMEA2000
+  https://github.com/ttlappalainen/NMEA0183
+
+The NimBLE-Arduino library is used under the Apache 2.0 license:
+  https://github.com/h2zero/NimBLE-Arduino
+
+All other third-party libraries are used under their respective licenses as
+declared in platformio.ini.
