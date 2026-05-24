@@ -35,8 +35,9 @@
 #define MOCK_VARIATION        -4.5     // degrees, westerly declination — NW Scotland
 
 // Local sensor mocks — used in MOCK_MODE 2 (full mock) and in MOCK_MODE 1 until
-// the real sensor initialises (DS18B20 returns a valid reading / ADC reads > 5 V).
-#define MOCK_FRIDGE_TEMP       4.2     // °C
+// the real sensor initialises.
+#define MOCK_EXHAUST_TEMP      85.0    // °C  typical diesel exhaust at cruise
+#define MOCK_FRIDGE_TEMP       4.2     // °C  (MAX31865 not yet wired — always mock until hardware added)
 #define MOCK_BATTERY_VOLTAGE   12.8    // V
 
 #endif // _MockData_H_

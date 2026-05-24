@@ -55,7 +55,8 @@
 
 #define ENABLE_DEBUG_LOG 1 // Debug log, set to 1 to enable AIS forward on USB-Serial / 2 for ADC voltage to support calibration
 #define UDP_Forwarding 1   // Set to 1 for forwarding AIS from serial2 to UDP brodcast
-#define HighTempAlarm 12   // Alarm level for fridge temperature (higher)
+#define HighExhaustAlarm 120 // Alarm level for exhaust temperature (°C)
+#define HighFridgeAlarm  12  // Alarm level for fridge temperature (°C, MAX31865 — not yet fitted)
 #define LowVoltageAlarm 11 // Alarm level for battery voltage (lower)
 
 #define ADC_Calibration_Value 34.3 // The real value depends on the true resistor values for the ADC input (100K / 27 K)
@@ -71,7 +72,8 @@ static bool    staConnected = false;
 // Sensor live-data flags — used in MOCK_MODE 1 to switch from mock to real per source.
 // Each flag latches true once the sensor provides a valid reading and never resets.
 static bool n2kActive     = false;  // set on first NMEA2000 message received
-static bool ds18b20Active = false;  // set when DS18B20 returns a valid temperature
+static bool exhaustActive = false;  // set when DS18B20 returns a valid exhaust temperature
+static bool fridgeActive  = false;  // set when MAX31865 initialises (hardware not yet fitted)
 static bool adcActive     = false;  // set when battery ADC reads > 5.0 V
 
 // MQTT config — loaded from NVS ("mqtt_cfg") at boot, editable via /settings
@@ -332,8 +334,8 @@ void GetTemperature( void * parameter) {
     vTaskDelay(100);
     float tmp = sensors.getTempCByIndex(0);
     if (tmp != DEVICE_DISCONNECTED_C) {
-      LocalSensors.FridgeTemp = tmp;
-      ds18b20Active = true;
+      LocalSensors.ExhaustTemp = tmp;
+      exhaustActive = true;
     }
     vTaskDelay(250);
     digitalWrite(INTERNAL_LED, LOW);
@@ -351,7 +353,7 @@ void Ereignis_ADC()     // Wenn "http://<ip address>/ADC.txt" aufgerufen wurde
 {
 
   webserver.sendHeader("Cache-Control", "no-cache");  // Sehr wichtig !!!!!!!!!!!!!!!!!!!
-  webserver.send(200, "text/plain", String(LocalSensors.FridgeTemp));
+  webserver.send(200, "text/plain", String(LocalSensors.ExhaustTemp));
 }
 
 void handle_sw_js()
@@ -637,15 +639,16 @@ void mqttPublish() {
   // Build full telemetry JSON — same fields as /data plus Ruuvi array
   JsonDocument doc;
 
-  bool useMockN2k    = (MOCK_MODE == 2) || (MOCK_MODE == 1 && !n2kActive);
-  bool useMockFridge = (MOCK_MODE == 2) || (MOCK_MODE == 1 && !ds18b20Active);
-  bool useMockAdc    = (MOCK_MODE == 2) || (MOCK_MODE == 1 && !adcActive);
+  bool useMockN2k     = (MOCK_MODE == 2) || (MOCK_MODE == 1 && !n2kActive);
+  bool useMockExhaust = (MOCK_MODE == 2) || (MOCK_MODE == 1 && !exhaustActive);
+  bool useMockFridge  = (MOCK_MODE == 2) || (MOCK_MODE == 1 && !fridgeActive);
+  bool useMockAdc     = (MOCK_MODE == 2) || (MOCK_MODE == 1 && !adcActive);
 
   const char* dataSource =
-    (MOCK_MODE == 0)                               ? "live"    :
-    (MOCK_MODE == 2)                               ? "mock"    :
-    (!useMockN2k && !useMockFridge && !useMockAdc) ? "live"    :
-    (useMockN2k  && useMockFridge  && useMockAdc)  ? "mock"    : "partial";
+    (MOCK_MODE == 0)                                                    ? "live"    :
+    (MOCK_MODE == 2)                                                    ? "mock"    :
+    (!useMockN2k && !useMockExhaust && !useMockFridge && !useMockAdc)  ? "live"    :
+    (useMockN2k  && useMockExhaust  && useMockFridge  && useMockAdc)   ? "mock"    : "partial";
   doc["dataSource"]       = dataSource;
 
   doc["Latitude"]         = useMockN2k ? MOCK_LATITUDE    : BoatData.Latitude;
@@ -662,8 +665,9 @@ void mqttPublish() {
   doc["WaterDepth"]       = useMockN2k ? MOCK_WATER_DEPTH : BoatData.WaterDepth;
   doc["WaterTemperature"] = useMockN2k ? MOCK_WATER_TEMP  : BoatData.WaterTemperature;
 
-  doc["FridgeTemperature"] = useMockFridge ? MOCK_FRIDGE_TEMP     : LocalSensors.FridgeTemp;
-  doc["BatteryVoltage"]    = useMockAdc    ? MOCK_BATTERY_VOLTAGE : LocalSensors.BatteryVoltage;
+  doc["ExhaustTemperature"] = useMockExhaust ? MOCK_EXHAUST_TEMP    : LocalSensors.ExhaustTemp;
+  doc["FridgeTemperature"]  = useMockFridge  ? MOCK_FRIDGE_TEMP     : LocalSensors.FridgeTemp;
+  doc["BatteryVoltage"]     = useMockAdc     ? MOCK_BATTERY_VOLTAGE : LocalSensors.BatteryVoltage;
   doc["timestamp"]         = millis() / 1000;  // seconds since boot
 
   // Ruuvi sensors
@@ -805,7 +809,7 @@ void SendN2kEngine() {
   if ( IsTimeToUpdate(SlowDataUpdated) ) {
     SetNextUpdate(SlowDataUpdated, SlowDataUpdatePeriod);
 
-    SetN2kEngineDynamicParam(N2kMsg, 0, N2kDoubleNA, N2kDoubleNA, CToKelvin(LocalSensors.FridgeTemp), LocalSensors.BatteryVoltage, N2kDoubleNA, N2kDoubleNA, N2kDoubleNA, N2kDoubleNA, N2kInt8NA, N2kInt8NA, true);
+    SetN2kEngineDynamicParam(N2kMsg, 0, N2kDoubleNA, N2kDoubleNA, CToKelvin(LocalSensors.ExhaustTemp), LocalSensors.BatteryVoltage, N2kDoubleNA, N2kDoubleNA, N2kDoubleNA, N2kDoubleNA, N2kInt8NA, N2kInt8NA, true);
     NMEA2000.SendMsg(N2kMsg);
   }
 }
@@ -859,8 +863,8 @@ void SendHardcodedNMEA() {
   char   latH = MOCK_LATITUDE  >= 0 ? 'N' : 'S';
   char   lonH = MOCK_LONGITUDE >= 0 ? 'E' : 'W';
 
-  // Fridge XDR: use mock value unless DS18B20 has already provided a real reading
-  float fridgeForNMEA = (MOCK_MODE == 2 || !ds18b20Active) ? MOCK_FRIDGE_TEMP : LocalSensors.FridgeTemp;
+  // Exhaust XDR: use mock value unless DS18B20 has already provided a real reading
+  float exhaustForNMEA = (MOCK_MODE == 2 || !exhaustActive) ? MOCK_EXHAUST_TEMP : LocalSensors.ExhaustTemp;
 
   char rmcBuf[80], vtgBuf[60], mwvRBuf[40], mwvTBuf[40], dbtBuf[50], xdrBuf[40];
   snprintf(rmcBuf,  sizeof(rmcBuf),  "GPRMC,120000.00,A,%s,%c,%s,%c,%.1f,%.1f,140526,,",
@@ -872,7 +876,7 @@ void SendHardcodedNMEA() {
   snprintf(dbtBuf,  sizeof(dbtBuf),  "SDDBT,%.2f,f,%.2f,M,%.2f,F",
            (float)(MOCK_WATER_DEPTH * 3.28084), (float)MOCK_WATER_DEPTH,
            (float)(MOCK_WATER_DEPTH * 0.546807));
-  snprintf(xdrBuf,  sizeof(xdrBuf),  "IIXDR,C,%.2f,C,FRIDGE", fridgeForNMEA);
+  snprintf(xdrBuf,  sizeof(xdrBuf),  "IIXDR,C,%.2f,C,EXHAUST", exhaustForNMEA);
 
   udp.beginPacket(udpAddress, udpPort);
   udp.print(addNMEAChecksum(String(rmcBuf)));
@@ -973,8 +977,9 @@ void handle_json() {
   root["Altitude"] = BoatData.Altitude;
   root["GPSTime"] = BoatData.GPSTime;
   root["DaysSince1970"] = BoatData.DaysSince1970;
-  root["FridgeTemperature"] = LocalSensors.FridgeTemp;
-  root["BatteryVoltage"]    = LocalSensors.BatteryVoltage;
+  root["ExhaustTemperature"] = LocalSensors.ExhaustTemp;
+  root["FridgeTemperature"]  = LocalSensors.FridgeTemp;
+  root["BatteryVoltage"]     = LocalSensors.BatteryVoltage;
 
 
   //Serial.print(F("Sending: "));
@@ -1004,9 +1009,10 @@ void handle_data_json() {
   JsonDocument root;
 
   // Determine which data source to use for each sensor group
-  bool useMockN2k    = (MOCK_MODE == 2) || (MOCK_MODE == 1 && !n2kActive);
-  bool useMockFridge = (MOCK_MODE == 2) || (MOCK_MODE == 1 && !ds18b20Active);
-  bool useMockAdc    = (MOCK_MODE == 2) || (MOCK_MODE == 1 && !adcActive);
+  bool useMockN2k     = (MOCK_MODE == 2) || (MOCK_MODE == 1 && !n2kActive);
+  bool useMockExhaust = (MOCK_MODE == 2) || (MOCK_MODE == 1 && !exhaustActive);
+  bool useMockFridge  = (MOCK_MODE == 2) || (MOCK_MODE == 1 && !fridgeActive);
+  bool useMockAdc     = (MOCK_MODE == 2) || (MOCK_MODE == 1 && !adcActive);
 
   root["Latitude"]         = useMockN2k ? MOCK_LATITUDE        : BoatData.Latitude;
   root["Longitude"]        = useMockN2k ? MOCK_LONGITUDE       : BoatData.Longitude;
@@ -1037,14 +1043,15 @@ void handle_data_json() {
   root["localValid"] = 1;
 
   const char* dataSource =
-    (MOCK_MODE == 0)                               ? "live"    :
-    (MOCK_MODE == 2)                               ? "mock"    :
-    (!useMockN2k && !useMockFridge && !useMockAdc) ? "live"    :
-    (useMockN2k  && useMockFridge  && useMockAdc)  ? "mock"    : "partial";
+    (MOCK_MODE == 0)                                                    ? "live"    :
+    (MOCK_MODE == 2)                                                    ? "mock"    :
+    (!useMockN2k && !useMockExhaust && !useMockFridge && !useMockAdc)  ? "live"    :
+    (useMockN2k  && useMockExhaust  && useMockFridge  && useMockAdc)   ? "mock"    : "partial";
   root["dataSource"] = dataSource;
 
-  root["FridgeTemperature"] = useMockFridge ? MOCK_FRIDGE_TEMP     : LocalSensors.FridgeTemp;
-  root["BatteryVoltage"]    = useMockAdc    ? MOCK_BATTERY_VOLTAGE : LocalSensors.BatteryVoltage;
+  root["ExhaustTemperature"] = useMockExhaust ? MOCK_EXHAUST_TEMP    : LocalSensors.ExhaustTemp;
+  root["FridgeTemperature"]  = useMockFridge  ? MOCK_FRIDGE_TEMP     : LocalSensors.FridgeTemp;
+  root["BatteryVoltage"]     = useMockAdc     ? MOCK_BATTERY_VOLTAGE : LocalSensors.BatteryVoltage;
 
   // Ruuvi BLE sensors — snapshot under mutex
   {
@@ -1185,12 +1192,12 @@ digitalWrite(INTERNAL_LED, HIGH);
 
 #if ENABLE_DEBUG_LOG == 2
   Serial.print("Voltage:"); Serial.println(LocalSensors.BatteryVoltage);
-  Serial.print("Temperature: "); Serial.println(LocalSensors.FridgeTemp);
+  Serial.print("Exhaust: "); Serial.println(LocalSensors.ExhaustTemp);
   Serial.println("");
 #endif
 
   alarmstate = false;
-  if (LocalSensors.FridgeTemp > HighTempAlarm || LocalSensors.BatteryVoltage < LowVoltageAlarm) {
+  if (LocalSensors.ExhaustTemp > HighExhaustAlarm || LocalSensors.FridgeTemp > HighFridgeAlarm || LocalSensors.BatteryVoltage < LowVoltageAlarm) {
     alarmstate = true;
   }
   if (alarmstate == true && acknowledge == false) {

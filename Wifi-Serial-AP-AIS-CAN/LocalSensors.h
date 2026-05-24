@@ -6,13 +6,9 @@
 // To add a sensor: add a field here, populate it in the relevant read function,
 // and it will automatically appear in the /data JSON endpoint.
 struct tLocalSensors {
-  float FridgeTemp     = 0;   // DS18B20 on GPIO 13
+  float ExhaustTemp    = 0;   // DS18B20 on GPIO 13 (1-Wire)
+  float FridgeTemp     = 0;   // PT1000 via MAX31865 (not yet wired — stays 0 until hardware added)
   float BatteryVoltage = 0;   // ADC on GPIO 34 via voltage divider
-  // Add future sensors here, e.g.:
-  // float CabinTemp        = 0;
-  // float EngineCoolantTemp= 0;
-  // float OilPressure      = 0;
-  // float StarterVoltage   = 0;
 };
 
 #endif // _LocalSensors_H_
