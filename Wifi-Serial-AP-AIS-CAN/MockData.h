@@ -1,9 +1,16 @@
 #ifndef _MockData_H_
 #define _MockData_H_
 
+// ── Mock mode ─────────────────────────────────────────────────────────────────
+// 0 = full real    — all data from hardware; mock values never used
+// 1 = partial mock — mock fills in for each sensor group until it initialises;
+//                    once a sensor provides a valid reading it takes over permanently
+// 2 = full mock    — all values from constants below (useful for UI development
+//                    and demos away from the boat)
+#define MOCK_MODE 1
+
 // ── Single source of truth for all simulation values ─────────────────────────
 // Edit here to change the simulated vessel state.
-// Only compiled / active when USE_MOCK_DATA is defined in the .ino.
 //
 // Scenario: Arisaig Harbour, NW Highlands — running due west at 5.5 kts,
 //           10 kts of wind from due east (dead downwind run).
@@ -27,9 +34,8 @@
 #define MOCK_GPS_TIME          43200.0 // s  (12:00:00 UTC)
 #define MOCK_VARIATION        -4.5     // degrees, westerly declination — NW Scotland
 
-// Local-sensor mocks are informational only; the real DS18B20 and ADC are
-// always active and will report their own values.  These constants are used
-// only by the Playwright preview script (c:/tmp/preview_dashboard.mjs).
+// Local sensor mocks — used in MOCK_MODE 2 (full mock) and in MOCK_MODE 1 until
+// the real sensor initialises (DS18B20 returns a valid reading / ADC reads > 5 V).
 #define MOCK_FRIDGE_TEMP       4.2     // °C
 #define MOCK_BATTERY_VOLTAGE   12.8    // V
 

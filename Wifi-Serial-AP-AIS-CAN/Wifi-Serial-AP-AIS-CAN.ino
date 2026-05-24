@@ -46,10 +46,10 @@
 #include "RuuviScanner.h"
 
 // ── Simulation mode ──────────────────────────────────────────────────────────
-// Comment out the next line when connected to real NMEA2000 / AIS hardware.
-// With mock disabled and no live data the dashboard shows a clear NO DATA
-// indicator for every instrument group that has not been updated by hardware.
-#define USE_MOCK_DATA
+// Set MOCK_MODE in MockData.h:
+//   0 = full real    — hardware only, no mock data used
+//   1 = partial mock — mock fills in until each sensor group initialises (default)
+//   2 = full mock    — all values from MockData.h constants (demos / UI dev)
 #include "MockData.h"
 
 
@@ -67,6 +67,12 @@ static char    apPass[65]  = "nmea2000";
 static char    staSsid[33] = "";
 static char    staPass[65] = "";
 static bool    staConnected = false;
+
+// Sensor live-data flags — used in MOCK_MODE 1 to switch from mock to real per source.
+// Each flag latches true once the sensor provides a valid reading and never resets.
+static bool n2kActive     = false;  // set on first NMEA2000 message received
+static bool ds18b20Active = false;  // set when DS18B20 returns a valid temperature
+static bool adcActive     = false;  // set when battery ADC reads > 5.0 V
 
 // MQTT config — loaded from NVS ("mqtt_cfg") at boot, editable via /settings
 static bool mqttEnabled      = false;
@@ -320,13 +326,15 @@ digitalWrite(INTERNAL_LED, HIGH);
 
 // This task runs isolated on core 0 because sensors.requestTemperatures() is slow and blocking for about 750 ms
 void GetTemperature( void * parameter) {
-  float tmp = 12.3;
   for (;;) {
     digitalWrite(INTERNAL_LED, HIGH);
-    sensors.requestTemperatures(); // Send the command to get temperatures
+    sensors.requestTemperatures();
     vTaskDelay(100);
-    //tmp = sensors.getTempCByIndex(0);
-    if (tmp != -127) LocalSensors.FridgeTemp = tmp;
+    float tmp = sensors.getTempCByIndex(0);
+    if (tmp != DEVICE_DISCONNECTED_C) {
+      LocalSensors.FridgeTemp = tmp;
+      ds18b20Active = true;
+    }
     vTaskDelay(250);
     digitalWrite(INTERNAL_LED, LOW);
   }
@@ -629,40 +637,33 @@ void mqttPublish() {
   // Build full telemetry JSON — same fields as /data plus Ruuvi array
   JsonDocument doc;
 
-#ifdef USE_MOCK_DATA
-  doc["dataSource"]       = "mock";
-  doc["Latitude"]         = MOCK_LATITUDE;
-  doc["Longitude"]        = MOCK_LONGITUDE;
-  doc["Heading"]          = MOCK_HEADING;
-  doc["COG"]              = MOCK_COG;
-  doc["SOG"]              = MOCK_SOG;
-  doc["STW"]              = MOCK_STW;
-  doc["AWS"]              = MOCK_AWS;
-  doc["TWS"]              = MOCK_TWS;
-  doc["AWA"]              = MOCK_AWA;
-  doc["TWA"]              = MOCK_TWA;
-  doc["TWD"]              = MOCK_TWD;
-  doc["WaterDepth"]       = MOCK_WATER_DEPTH;
-  doc["WaterTemperature"] = MOCK_WATER_TEMP;
-#else
-  doc["dataSource"]       = "live";
-  doc["Latitude"]         = BoatData.Latitude;
-  doc["Longitude"]        = BoatData.Longitude;
-  doc["Heading"]          = BoatData.Heading;
-  doc["COG"]              = BoatData.COG;
-  doc["SOG"]              = BoatData.SOG;
-  doc["STW"]              = BoatData.STW;
-  doc["AWS"]              = BoatData.AWS;
-  doc["TWS"]              = BoatData.TWS;
-  doc["AWA"]              = BoatData.AWA;
-  doc["TWA"]              = BoatData.TWA;
-  doc["TWD"]              = BoatData.TWD;
-  doc["WaterDepth"]       = BoatData.WaterDepth;
-  doc["WaterTemperature"] = BoatData.WaterTemperature;
-#endif
+  bool useMockN2k    = (MOCK_MODE == 2) || (MOCK_MODE == 1 && !n2kActive);
+  bool useMockFridge = (MOCK_MODE == 2) || (MOCK_MODE == 1 && !ds18b20Active);
+  bool useMockAdc    = (MOCK_MODE == 2) || (MOCK_MODE == 1 && !adcActive);
 
-  doc["FridgeTemperature"] = LocalSensors.FridgeTemp;
-  doc["BatteryVoltage"]    = LocalSensors.BatteryVoltage;
+  const char* dataSource =
+    (MOCK_MODE == 0)                               ? "live"    :
+    (MOCK_MODE == 2)                               ? "mock"    :
+    (!useMockN2k && !useMockFridge && !useMockAdc) ? "live"    :
+    (useMockN2k  && useMockFridge  && useMockAdc)  ? "mock"    : "partial";
+  doc["dataSource"]       = dataSource;
+
+  doc["Latitude"]         = useMockN2k ? MOCK_LATITUDE    : BoatData.Latitude;
+  doc["Longitude"]        = useMockN2k ? MOCK_LONGITUDE   : BoatData.Longitude;
+  doc["Heading"]          = useMockN2k ? MOCK_HEADING     : BoatData.Heading;
+  doc["COG"]              = useMockN2k ? MOCK_COG         : BoatData.COG;
+  doc["SOG"]              = useMockN2k ? MOCK_SOG         : BoatData.SOG;
+  doc["STW"]              = useMockN2k ? MOCK_STW         : BoatData.STW;
+  doc["AWS"]              = useMockN2k ? MOCK_AWS         : BoatData.AWS;
+  doc["TWS"]              = useMockN2k ? MOCK_TWS         : BoatData.TWS;
+  doc["AWA"]              = useMockN2k ? MOCK_AWA         : BoatData.AWA;
+  doc["TWA"]              = useMockN2k ? MOCK_TWA         : BoatData.TWA;
+  doc["TWD"]              = useMockN2k ? MOCK_TWD         : BoatData.TWD;
+  doc["WaterDepth"]       = useMockN2k ? MOCK_WATER_DEPTH : BoatData.WaterDepth;
+  doc["WaterTemperature"] = useMockN2k ? MOCK_WATER_TEMP  : BoatData.WaterTemperature;
+
+  doc["FridgeTemperature"] = useMockFridge ? MOCK_FRIDGE_TEMP     : LocalSensors.FridgeTemp;
+  doc["BatteryVoltage"]    = useMockAdc    ? MOCK_BATTERY_VOLTAGE : LocalSensors.BatteryVoltage;
   doc["timestamp"]         = millis() / 1000;  // seconds since boot
 
   // Ruuvi sensors
@@ -765,7 +766,7 @@ void SendBufToClients(const char *buf) {
 //*****************************************************************************
 //NMEA 2000 message handler
 void HandleNMEA2000Msg(const tN2kMsg &N2kMsg) {
-
+  n2kActive = true;  // latch: bus is live
 
   if ( !SendSeaSmart ) return;
 
@@ -818,14 +819,16 @@ String addNMEAChecksum(const String &sentence) {
   return "$" + sentence + String(buf);
 }
 
-#ifdef USE_MOCK_DATA
+#if MOCK_MODE > 0
 void SendHardcodedNMEA() {
+  // Partial mode: once the NMEA2000 bus is live, real data flows — stop injecting mock.
+  if (MOCK_MODE == 1 && n2kActive) return;
+
   static unsigned long nextSend = 0;
   if (millis() < nextSend) return;
   nextSend = millis() + 1000;
 
-  // Mirror MockData constants into BoatData so the /data endpoint and the UDP
-  // NMEA broadcast stay in sync.  All values come from MockData.h — edit there.
+  // Mirror mock nav values into BoatData so the /data endpoint and UDP broadcast stay in sync.
   BoatData.Latitude         = MOCK_LATITUDE;
   BoatData.Longitude        = MOCK_LONGITUDE;
   BoatData.Heading          = MOCK_HEADING;
@@ -856,6 +859,9 @@ void SendHardcodedNMEA() {
   char   latH = MOCK_LATITUDE  >= 0 ? 'N' : 'S';
   char   lonH = MOCK_LONGITUDE >= 0 ? 'E' : 'W';
 
+  // Fridge XDR: use mock value unless DS18B20 has already provided a real reading
+  float fridgeForNMEA = (MOCK_MODE == 2 || !ds18b20Active) ? MOCK_FRIDGE_TEMP : LocalSensors.FridgeTemp;
+
   char rmcBuf[80], vtgBuf[60], mwvRBuf[40], mwvTBuf[40], dbtBuf[50], xdrBuf[40];
   snprintf(rmcBuf,  sizeof(rmcBuf),  "GPRMC,120000.00,A,%s,%c,%s,%c,%.1f,%.1f,140526,,",
            latS, latH, lonS, lonH, (float)MOCK_SOG, (float)MOCK_COG);
@@ -866,7 +872,7 @@ void SendHardcodedNMEA() {
   snprintf(dbtBuf,  sizeof(dbtBuf),  "SDDBT,%.2f,f,%.2f,M,%.2f,F",
            (float)(MOCK_WATER_DEPTH * 3.28084), (float)MOCK_WATER_DEPTH,
            (float)(MOCK_WATER_DEPTH * 0.546807));
-  snprintf(xdrBuf,  sizeof(xdrBuf),  "IIXDR,C,%.2f,C,FRIDGE", LocalSensors.FridgeTemp);
+  snprintf(xdrBuf,  sizeof(xdrBuf),  "IIXDR,C,%.2f,C,FRIDGE", fridgeForNMEA);
 
   udp.beginPacket(udpAddress, udpPort);
   udp.print(addNMEAChecksum(String(rmcBuf)));
@@ -877,7 +883,7 @@ void SendHardcodedNMEA() {
   udp.print(addNMEAChecksum(String(xdrBuf)));
   udp.endPacket();
 }
-#endif // USE_MOCK_DATA
+#endif // MOCK_MODE > 0
 
 //*****************************************************************************
 void AddClient(WiFiClient &client) {
@@ -997,67 +1003,48 @@ void handle_json() {
 void handle_data_json() {
   JsonDocument root;
 
-#ifdef USE_MOCK_DATA
-  root["Latitude"]         = MOCK_LATITUDE;
-  root["Longitude"]        = MOCK_LONGITUDE;
-  root["Heading"]          = MOCK_HEADING;
-  root["COG"]              = MOCK_COG;
-  root["SOG"]              = MOCK_SOG;
-  root["STW"]              = MOCK_STW;
-  root["AWS"]              = MOCK_AWS;
-  root["TWS"]              = MOCK_TWS;
-  root["AWA"]              = MOCK_AWA;
-  root["TWA"]              = MOCK_TWA;
-  root["TWD"]              = MOCK_TWD;
-  root["MaxAws"]           = MOCK_AWS;
-  root["MaxTws"]           = MOCK_TWS;
-  root["TripLog"]          = MOCK_TRIP_LOG;
-  root["Log"]              = MOCK_TOTAL_LOG;
-  root["RudderPosition"]   = MOCK_RUDDER_POSITION;
-  root["WaterTemperature"] = MOCK_WATER_TEMP;
-  root["WaterDepth"]       = MOCK_WATER_DEPTH;
-  root["Variation"]        = MOCK_VARIATION;
-  root["Altitude"]         = 0.0;
-  root["GPSTime"]          = MOCK_GPS_TIME;
-  root["DaysSince1970"]    = 0.0;
-  root["dataSource"]       = "mock";
-  root["gpsValid"]         = 1;
-  root["windValid"]        = 1;
-  root["depthValid"]       = 1;
-  root["localValid"]       = 1;
-#else
-  root["Latitude"]         = BoatData.Latitude;
-  root["Longitude"]        = BoatData.Longitude;
-  root["Heading"]          = BoatData.Heading;
-  root["COG"]              = BoatData.COG;
-  root["SOG"]              = BoatData.SOG;
-  root["STW"]              = BoatData.STW;
-  root["AWS"]              = BoatData.AWS;
-  root["TWS"]              = BoatData.TWS;
-  root["AWA"]              = BoatData.AWA;
-  root["TWA"]              = BoatData.TWA;
-  root["TWD"]              = BoatData.TWD;
-  root["MaxAws"]           = BoatData.MaxAws;
-  root["MaxTws"]           = BoatData.MaxTws;
-  root["TripLog"]          = BoatData.TripLog;
-  root["Log"]              = BoatData.Log;
-  root["RudderPosition"]   = BoatData.RudderPosition;
-  root["WaterTemperature"] = BoatData.WaterTemperature;
-  root["WaterDepth"]       = BoatData.WaterDepth;
-  root["Variation"]        = BoatData.Variation;
-  root["Altitude"]         = BoatData.Altitude;
-  root["GPSTime"]          = BoatData.GPSTime;
-  root["DaysSince1970"]    = BoatData.DaysSince1970;
-  root["dataSource"]       = "live";
-  root["gpsValid"]         = (fabs(BoatData.Latitude) > 0.001 || fabs(BoatData.Longitude) > 0.001) ? 1 : 0;
-  root["windValid"]        = (BoatData.AWS > 0.01 || BoatData.TWS > 0.01) ? 1 : 0;
-  root["depthValid"]       = (BoatData.WaterDepth > 0.01) ? 1 : 0;
-  root["localValid"]       = (LocalSensors.BatteryVoltage > 0.01) ? 1 : 0;
-#endif
+  // Determine which data source to use for each sensor group
+  bool useMockN2k    = (MOCK_MODE == 2) || (MOCK_MODE == 1 && !n2kActive);
+  bool useMockFridge = (MOCK_MODE == 2) || (MOCK_MODE == 1 && !ds18b20Active);
+  bool useMockAdc    = (MOCK_MODE == 2) || (MOCK_MODE == 1 && !adcActive);
 
-  // Local sensors always come from real on-board hardware regardless of mode
-  root["FridgeTemperature"] = LocalSensors.FridgeTemp;
-  root["BatteryVoltage"]    = LocalSensors.BatteryVoltage;
+  root["Latitude"]         = useMockN2k ? MOCK_LATITUDE        : BoatData.Latitude;
+  root["Longitude"]        = useMockN2k ? MOCK_LONGITUDE       : BoatData.Longitude;
+  root["Heading"]          = useMockN2k ? MOCK_HEADING         : BoatData.Heading;
+  root["COG"]              = useMockN2k ? MOCK_COG             : BoatData.COG;
+  root["SOG"]              = useMockN2k ? MOCK_SOG             : BoatData.SOG;
+  root["STW"]              = useMockN2k ? MOCK_STW             : BoatData.STW;
+  root["AWS"]              = useMockN2k ? MOCK_AWS             : BoatData.AWS;
+  root["TWS"]              = useMockN2k ? MOCK_TWS             : BoatData.TWS;
+  root["AWA"]              = useMockN2k ? MOCK_AWA             : BoatData.AWA;
+  root["TWA"]              = useMockN2k ? MOCK_TWA             : BoatData.TWA;
+  root["TWD"]              = useMockN2k ? MOCK_TWD             : BoatData.TWD;
+  root["MaxAws"]           = useMockN2k ? MOCK_AWS             : BoatData.MaxAws;
+  root["MaxTws"]           = useMockN2k ? MOCK_TWS             : BoatData.MaxTws;
+  root["TripLog"]          = useMockN2k ? MOCK_TRIP_LOG        : BoatData.TripLog;
+  root["Log"]              = useMockN2k ? MOCK_TOTAL_LOG       : BoatData.Log;
+  root["RudderPosition"]   = useMockN2k ? MOCK_RUDDER_POSITION : BoatData.RudderPosition;
+  root["WaterTemperature"] = useMockN2k ? MOCK_WATER_TEMP      : BoatData.WaterTemperature;
+  root["WaterDepth"]       = useMockN2k ? MOCK_WATER_DEPTH     : BoatData.WaterDepth;
+  root["Variation"]        = useMockN2k ? MOCK_VARIATION       : BoatData.Variation;
+  root["Altitude"]         = useMockN2k ? 0.0                  : BoatData.Altitude;
+  root["GPSTime"]          = useMockN2k ? MOCK_GPS_TIME        : BoatData.GPSTime;
+  root["DaysSince1970"]    = useMockN2k ? 0.0                  : (double)BoatData.DaysSince1970;
+
+  root["gpsValid"]   = useMockN2k ? 1 : (fabs(BoatData.Latitude) > 0.001 || fabs(BoatData.Longitude) > 0.001) ? 1 : 0;
+  root["windValid"]  = useMockN2k ? 1 : (BoatData.AWS > 0.01 || BoatData.TWS > 0.01) ? 1 : 0;
+  root["depthValid"] = useMockN2k ? 1 : (BoatData.WaterDepth > 0.01) ? 1 : 0;
+  root["localValid"] = 1;
+
+  const char* dataSource =
+    (MOCK_MODE == 0)                               ? "live"    :
+    (MOCK_MODE == 2)                               ? "mock"    :
+    (!useMockN2k && !useMockFridge && !useMockAdc) ? "live"    :
+    (useMockN2k  && useMockFridge  && useMockAdc)  ? "mock"    : "partial";
+  root["dataSource"] = dataSource;
+
+  root["FridgeTemperature"] = useMockFridge ? MOCK_FRIDGE_TEMP     : LocalSensors.FridgeTemp;
+  root["BatteryVoltage"]    = useMockAdc    ? MOCK_BATTERY_VOLTAGE : LocalSensors.BatteryVoltage;
 
   // Ruuvi BLE sensors — snapshot under mutex
   {
@@ -1125,6 +1112,7 @@ digitalWrite(INTERNAL_LED, HIGH);
   }
 
   LocalSensors.BatteryVoltage = ((LocalSensors.BatteryVoltage * 15) + (ReadVoltage(ADCpin) * ADC_Calibration_Value / 4096)) / 16; // low-pass filter to eliminate ADC spikes
+  if (LocalSensors.BatteryVoltage > 5.0) adcActive = true;
 
   SendN2kEngine();
   // Send Ruuvi environmental data to NMEA2000 bus every 10 s
@@ -1156,7 +1144,7 @@ digitalWrite(INTERNAL_LED, HIGH);
       }
     }
   }
-#ifdef USE_MOCK_DATA
+#if MOCK_MODE > 0
   SendHardcodedNMEA();
 #endif
   CheckConnections();
